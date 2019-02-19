@@ -4,22 +4,33 @@
 
 use super::super::frame::{ExecutionResult, Frame};
 use super::super::pyobject::{
-    AttributeProtocol, PyContext, PyFuncArgs, PyObject, PyObjectKind, PyObjectRef, PyResult,
-    TypeProtocol,
+    PyContext, PyFuncArgs, PyObject, PyObjectPayload, PyObjectRef, PyResult, TypeProtocol,
 };
 use super::super::vm::VirtualMachine;
 use super::objtype;
 
 pub fn init(context: &PyContext) {
-    let ref generator_type = context.generator_type;
-    generator_type.set_attr("__iter__", context.new_rustfunc(generator_iter));
-    generator_type.set_attr("__next__", context.new_rustfunc(generator_next));
-    generator_type.set_attr("send", context.new_rustfunc(generator_send));
+    let generator_type = &context.generator_type;
+    context.set_attr(
+        &generator_type,
+        "__iter__",
+        context.new_rustfunc(generator_iter),
+    );
+    context.set_attr(
+        &generator_type,
+        "__next__",
+        context.new_rustfunc(generator_next),
+    );
+    context.set_attr(
+        &generator_type,
+        "send",
+        context.new_rustfunc(generator_send),
+    );
 }
 
 pub fn new_generator(vm: &mut VirtualMachine, frame: Frame) -> PyResult {
     let g = PyObject::new(
-        PyObjectKind::Generator { frame: frame },
+        PyObjectPayload::Generator { frame },
         vm.ctx.generator_type.clone(),
     );
     Ok(g)
@@ -46,7 +57,7 @@ fn generator_send(vm: &mut VirtualMachine, args: PyFuncArgs) -> PyResult {
 }
 
 fn send(vm: &mut VirtualMachine, gen: &PyObjectRef, value: &PyObjectRef) -> PyResult {
-    if let PyObjectKind::Generator { ref mut frame } = gen.borrow_mut().kind {
+    if let PyObjectPayload::Generator { ref mut frame } = gen.borrow_mut().payload {
         frame.push_value(value.clone());
         match frame.run_frame(vm)? {
             ExecutionResult::Yield(value) => Ok(value),

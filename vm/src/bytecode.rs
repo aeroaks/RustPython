@@ -1,21 +1,18 @@
-/*
- * Implement python as a virtual machine with bytecodes.
- */
-
-/*
-let load_const_string = 0x16;
-let call_function = 0x64;
-*/
+//! Implement python as a virtual machine with bytecodes. This module
+//! implements bytecode structure.
 
 /*
  * Primitive instruction type, which can be encoded and decoded.
  */
 
+use num_bigint::BigInt;
 use num_complex::Complex64;
 use rustpython_parser::ast;
 use std::collections::HashMap;
 use std::fmt;
 
+/// Primary container of a single code object. Each python function has
+/// a codeobject. Also a module has a codeobject.
 #[derive(Clone, PartialEq)]
 pub struct CodeObject {
     pub instructions: Vec<Instruction>,
@@ -25,33 +22,10 @@ pub struct CodeObject {
     pub varargs: Option<Option<String>>, // *args or *
     pub kwonlyarg_names: Vec<String>,
     pub varkeywords: Option<Option<String>>, // **kwargs or **
-    pub source_path: Option<String>,
+    pub source_path: String,
+    pub first_line_number: usize,
     pub obj_name: String, // Name of the object that created this code object
     pub is_generator: bool,
-}
-
-impl CodeObject {
-    pub fn new(
-        arg_names: Vec<String>,
-        varargs: Option<Option<String>>,
-        kwonlyarg_names: Vec<String>,
-        varkeywords: Option<Option<String>>,
-        source_path: Option<String>,
-        obj_name: String,
-    ) -> CodeObject {
-        CodeObject {
-            instructions: Vec::new(),
-            label_map: HashMap::new(),
-            locations: Vec::new(),
-            arg_names: arg_names,
-            varargs: varargs,
-            kwonlyarg_names: kwonlyarg_names,
-            varkeywords: varkeywords,
-            source_path: source_path,
-            obj_name: obj_name,
-            is_generator: false,
-        }
-    }
 }
 
 bitflags! {
@@ -62,11 +36,15 @@ bitflags! {
 
 pub type Label = usize;
 
+/// A Single bytecode instruction.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Instruction {
     Import {
         name: String,
         symbol: Option<String>,
+    },
+    ImportStar {
+        name: String,
     },
     LoadName {
         name: String,
@@ -93,6 +71,7 @@ pub enum Instruction {
     },
     BinaryOperation {
         op: BinaryOperator,
+        inplace: bool,
     },
     LoadAttr {
         name: String,
@@ -124,7 +103,9 @@ pub enum Instruction {
     CallFunction {
         typ: CallType,
     },
-    ForIter,
+    ForIter {
+        target: Label,
+    },
     ReturnValue,
     YieldValue,
     YieldFrom,
@@ -144,6 +125,9 @@ pub enum Instruction {
     PopBlock,
     Raise {
         argc: usize,
+    },
+    BuildString {
+        size: usize,
     },
     BuildTuple {
         size: usize,
@@ -184,6 +168,9 @@ pub enum Instruction {
         after: usize,
     },
     Unpack,
+    FormatValue {
+        spec: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -195,7 +182,7 @@ pub enum CallType {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Constant {
-    Integer { value: i32 }, // TODO: replace by arbitrary big int math.
+    Integer { value: BigInt },
     Float { value: f64 },
     Complex { value: Complex64 },
     Boolean { value: bool },
@@ -253,6 +240,42 @@ pub enum BlockType {
     Except,
 }
 */
+
+impl CodeObject {
+    pub fn new(
+        arg_names: Vec<String>,
+        varargs: Option<Option<String>>,
+        kwonlyarg_names: Vec<String>,
+        varkeywords: Option<Option<String>>,
+        source_path: String,
+        first_line_number: usize,
+        obj_name: String,
+    ) -> CodeObject {
+        CodeObject {
+            instructions: Vec::new(),
+            label_map: HashMap::new(),
+            locations: Vec::new(),
+            arg_names,
+            varargs,
+            kwonlyarg_names,
+            varkeywords,
+            source_path,
+            first_line_number,
+            obj_name,
+            is_generator: false,
+        }
+    }
+
+    pub fn get_constants<'a>(&'a self) -> impl Iterator<Item = &'a Constant> {
+        self.instructions.iter().filter_map(|x| {
+            if let Instruction::LoadConst { value } = x {
+                Some(value)
+            } else {
+                None
+            }
+        })
+    }
+}
 
 impl fmt::Debug for CodeObject {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {

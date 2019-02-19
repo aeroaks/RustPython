@@ -1,8 +1,9 @@
-/*
- * Implement abstract syntax tree nodes for the python language.
- */
+//! Implement abstract syntax tree nodes for the python language.
+//!
+//! Roughly equivalent to this: https://docs.python.org/3/library/ast.html
 
 pub use super::lexer::Location;
+use num_bigint::BigInt;
 /*
 #[derive(Debug)]
 
@@ -40,6 +41,7 @@ pub struct Located<T> {
 
 pub type LocatedStatement = Located<Statement>;
 
+/// Abstract syntax tree nodes for python statements.
 #[derive(Debug, PartialEq)]
 pub enum Statement {
     Break,
@@ -63,12 +65,18 @@ pub enum Statement {
         value: Expression,
     },
     AugAssign {
-        target: Expression,
+        target: Box<Expression>,
         op: Operator,
-        value: Expression,
+        value: Box<Expression>,
     },
     Expression {
         expression: Expression,
+    },
+    Global {
+        names: Vec<String>,
+    },
+    Nonlocal {
+        names: Vec<String>,
     },
     If {
         test: Expression,
@@ -189,7 +197,7 @@ pub enum Expression {
         elements: Vec<Expression>,
     },
     String {
-        value: String,
+        value: StringGroup,
     },
     Bytes {
         value: Vec<u8>,
@@ -213,7 +221,7 @@ pub enum Expression {
 
 /*
  * In cpython this is called arguments, but we choose parameters to
- * distuingish between function parameters and actual call arguments.
+ * distinguish between function parameters and actual call arguments.
  */
 #[derive(Debug, PartialEq, Default)]
 pub struct Parameters {
@@ -278,8 +286,10 @@ pub enum BooleanOperator {
 
 #[derive(Debug, PartialEq)]
 pub enum UnaryOperator {
+    Pos,
     Neg,
     Not,
+    Inv,
 }
 
 #[derive(Debug, PartialEq)]
@@ -298,7 +308,21 @@ pub enum Comparison {
 
 #[derive(Debug, PartialEq)]
 pub enum Number {
-    Integer { value: i32 },
+    Integer { value: BigInt },
     Float { value: f64 },
     Complex { real: f64, imag: f64 },
+}
+
+#[derive(Debug, PartialEq)]
+pub enum StringGroup {
+    Constant {
+        value: String,
+    },
+    FormattedValue {
+        value: Box<Expression>,
+        spec: String,
+    },
+    Joined {
+        values: Vec<StringGroup>,
+    },
 }

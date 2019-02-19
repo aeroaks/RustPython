@@ -1,11 +1,50 @@
+//! This module takes care of lexing python source text. This means source
+//! code is translated into separate tokens.
+
 pub use super::token::Tok;
+use num_bigint::BigInt;
+use num_traits::Num;
+use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::str::FromStr;
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct IndentationLevel {
+    tabs: usize,
+    spaces: usize,
+}
+
+impl IndentationLevel {
+    fn new() -> IndentationLevel {
+        IndentationLevel { tabs: 0, spaces: 0 }
+    }
+    fn compare_strict(&self, other: &IndentationLevel) -> Option<Ordering> {
+        // We only know for sure that we're smaller or bigger if tabs
+        // and spaces both differ in the same direction. Otherwise we're
+        // dependent on the size of tabs.
+        if self.tabs < other.tabs {
+            if self.spaces <= other.spaces {
+                Some(Ordering::Less)
+            } else {
+                None
+            }
+        } else if self.tabs > other.tabs {
+            if self.spaces >= other.spaces {
+                Some(Ordering::Greater)
+            } else {
+                None
+            }
+        } else {
+            Some(self.spaces.cmp(&other.spaces))
+        }
+    }
+}
 
 pub struct Lexer<T: Iterator<Item = char>> {
     chars: T,
     at_begin_of_line: bool,
     nesting: usize, // Amount of parenthesis
-    indentation_stack: Vec<usize>,
+    indentation_stack: Vec<IndentationLevel>,
     pending: Vec<Spanned<Tok>>,
     chr0: Option<char>,
     chr1: Option<char>,
@@ -15,6 +54,7 @@ pub struct Lexer<T: Iterator<Item = char>> {
 #[derive(Debug)]
 pub enum LexicalError {
     StringError,
+    NestingError,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -25,10 +65,7 @@ pub struct Location {
 
 impl Location {
     pub fn new(row: usize, column: usize) -> Self {
-        Location {
-            row: row,
-            column: column,
-        }
+        Location { row, column }
     }
 
     pub fn get_row(&self) -> usize {
@@ -87,8 +124,7 @@ pub type Spanned<Tok> = Result<(Location, Tok, Location), LexicalError>;
 pub fn make_tokenizer<'a>(source: &'a str) -> impl Iterator<Item = Spanned<Tok>> + 'a {
     let nlh = NewlineHandler::new(source.chars());
     let lch = LineContinationHandler::new(nlh);
-    let lexer = Lexer::new(lch);
-    lexer
+    Lexer::new(lch)
 }
 
 // The newline handler is an iterator which collapses different newline
@@ -105,7 +141,7 @@ where
 {
     pub fn new(source: T) -> Self {
         let mut nlh = NewlineHandler {
-            source: source,
+            source,
             chr0: None,
             chr1: None,
         };
@@ -161,7 +197,7 @@ where
 {
     pub fn new(source: T) -> Self {
         let mut nlh = LineContinationHandler {
-            source: source,
+            source,
             chr0: None,
             chr1: None,
         };
@@ -191,6 +227,9 @@ where
                 // Skip backslash and newline
                 self.shift();
                 self.shift();
+            // Idea: insert trailing newline here:
+            // } else if self.chr0 != Some('\n') && self.chr1.is_none() {
+            //     self.chr1 = Some('\n');
             } else {
                 break;
             }
@@ -209,7 +248,7 @@ where
             chars: input,
             at_begin_of_line: true,
             nesting: 0,
-            indentation_stack: vec![0],
+            indentation_stack: vec![IndentationLevel::new()],
             pending: Vec::new(),
             chr0: None,
             location: Location::new(0, 0),
@@ -235,7 +274,6 @@ where
         let mut saw_f = false;
         loop {
             // Detect r"", f"", b"" and u""
-            // TODO: handle f-strings
             if !(saw_b || saw_u || saw_f) && (self.chr0 == Some('b') || self.chr0 == Some('B')) {
                 saw_b = true;
             } else if !(saw_b || saw_r || saw_u || saw_f)
@@ -271,31 +309,118 @@ where
         if keywords.contains_key(&name) {
             Ok((start_pos, keywords.remove(&name).unwrap(), end_pos))
         } else {
-            Ok((start_pos, Tok::Name { name: name }, end_pos))
+            Ok((start_pos, Tok::Name { name }, end_pos))
         }
     }
 
     fn lex_number(&mut self) -> Spanned<Tok> {
+        let start_pos = self.get_pos();
+        if self.chr0 == Some('0') {
+            if self.chr1 == Some('x') || self.chr1 == Some('X') {
+                // Hex!
+                self.next_char();
+                self.next_char();
+                self.lex_number_radix(start_pos, 16)
+            } else if self.chr1 == Some('o') || self.chr1 == Some('O') {
+                // Octal style!
+                self.next_char();
+                self.next_char();
+                self.lex_number_radix(start_pos, 8)
+            } else if self.chr1 == Some('b') || self.chr1 == Some('B') {
+                // Binary!
+                self.next_char();
+                self.next_char();
+                self.lex_number_radix(start_pos, 2)
+            } else {
+                self.lex_normal_number()
+            }
+        } else {
+            self.lex_normal_number()
+        }
+    }
+
+    fn lex_number_radix(&mut self, start_pos: Location, radix: u32) -> Spanned<Tok> {
         let mut value_text = String::new();
 
-        let start_pos = self.get_pos();
-        while self.is_number() {
-            value_text.push(self.next_char().unwrap());
-        }
-
-        // If float:
-        if let Some('.') = self.chr0 {
-            value_text.push(self.next_char().unwrap());
-            while self.is_number() {
+        loop {
+            if self.is_number(radix) {
                 value_text.push(self.next_char().unwrap());
+            } else if self.chr0 == Some('_') {
+                self.next_char();
+            } else {
+                break;
             }
         }
 
         let end_pos = self.get_pos();
+        let value = BigInt::from_str_radix(&value_text, radix).unwrap();
+        Ok((start_pos, Tok::Int { value }, end_pos))
+    }
 
-        let value = value_text;
+    fn lex_normal_number(&mut self) -> Spanned<Tok> {
+        let start_pos = self.get_pos();
 
-        return Ok((start_pos, Tok::Number { value: value }, end_pos));
+        let mut value_text = String::new();
+
+        // Normal number:
+        while self.is_number(10) {
+            value_text.push(self.next_char().unwrap());
+        }
+
+        // If float:
+        if self.chr0 == Some('.') || self.chr0 == Some('e') {
+            // Take '.':
+            if self.chr0 == Some('.') {
+                value_text.push(self.next_char().unwrap());
+                while self.is_number(10) {
+                    value_text.push(self.next_char().unwrap());
+                }
+            }
+
+            // 1e6 for example:
+            if self.chr0 == Some('e') {
+                value_text.push(self.next_char().unwrap());
+
+                // Optional +/-
+                if self.chr0 == Some('-') || self.chr0 == Some('+') {
+                    value_text.push(self.next_char().unwrap());
+                }
+
+                while self.is_number(10) {
+                    value_text.push(self.next_char().unwrap());
+                }
+            }
+
+            let value = f64::from_str(&value_text).unwrap();
+            // Parse trailing 'j':
+            if self.chr0 == Some('j') {
+                self.next_char();
+                let end_pos = self.get_pos();
+                Ok((
+                    start_pos,
+                    Tok::Complex {
+                        real: 0.0,
+                        imag: value,
+                    },
+                    end_pos,
+                ))
+            } else {
+                let end_pos = self.get_pos();
+                Ok((start_pos, Tok::Float { value }, end_pos))
+            }
+        } else {
+            // Parse trailing 'j':
+            if self.chr0 == Some('j') {
+                self.next_char();
+                let end_pos = self.get_pos();
+                let imag = f64::from_str(&value_text).unwrap();
+                Ok((start_pos, Tok::Complex { real: 0.0, imag }, end_pos))
+            } else {
+                let end_pos = self.get_pos();
+                let value = value_text.parse::<BigInt>().unwrap();
+                Ok((start_pos, Tok::Int { value }, end_pos))
+            }
+        }
     }
 
     fn lex_comment(&mut self) {
@@ -303,9 +428,7 @@ where
         self.next_char();
         loop {
             match self.chr0 {
-                Some('\n') => {
-                    return;
-                }
+                Some('\n') => return,
                 Some(_) => {}
                 None => return,
             }
@@ -318,7 +441,7 @@ where
         is_bytes: bool,
         is_raw: bool,
         _is_unicode: bool,
-        _is_fstring: bool,
+        is_fstring: bool,
     ) -> Spanned<Tok> {
         let quote_char = self.next_char().unwrap();
         let mut string_content = String::new();
@@ -409,23 +532,39 @@ where
         } else {
             Tok::String {
                 value: string_content,
+                is_fstring,
             }
         };
 
-        return Ok((start_pos, tok, end_pos));
+        Ok((start_pos, tok, end_pos))
     }
 
     fn is_char(&self) -> bool {
         match self.chr0 {
-            Some('a'...'z') | Some('A'...'Z') | Some('_') | Some('0'...'9') => return true,
-            _ => return false,
+            Some('a'...'z') | Some('A'...'Z') | Some('_') | Some('0'...'9') => true,
+            _ => false,
         }
     }
 
-    fn is_number(&self) -> bool {
-        match self.chr0 {
-            Some('0'...'9') => return true,
-            _ => return false,
+    fn is_number(&self, radix: u32) -> bool {
+        match radix {
+            2 => match self.chr0 {
+                Some('0'...'1') => true,
+                _ => false,
+            },
+            8 => match self.chr0 {
+                Some('0'...'7') => true,
+                _ => false,
+            },
+            10 => match self.chr0 {
+                Some('0'...'9') => true,
+                _ => false,
+            },
+            16 => match self.chr0 {
+                Some('0'...'9') | Some('a'...'f') | Some('A'...'F') => true,
+                _ => false,
+            },
+            x => unimplemented!("Radix not implemented: {}", x),
         }
     }
 
@@ -458,12 +597,23 @@ where
                 self.at_begin_of_line = false;
 
                 // Determine indentation:
-                let mut col: usize = 0;
+                let mut spaces: usize = 0;
+                let mut tabs: usize = 0;
                 loop {
                     match self.chr0 {
                         Some(' ') => {
                             self.next_char();
-                            col += 1;
+                            spaces += 1;
+                        }
+                        Some('\t') => {
+                            if spaces != 0 {
+                                // Don't allow tabs after spaces as part of indentation.
+                                // This is technically stricter than python3 but spaces before
+                                // tabs is even more insane than mixing spaces and tabs.
+                                panic!("Tabs not allowed as part of indentation after spaces");
+                            }
+                            self.next_char();
+                            tabs += 1;
                         }
                         Some('#') => {
                             self.lex_comment();
@@ -483,34 +633,54 @@ where
                     }
                 }
 
+                let indentation_level = IndentationLevel { spaces, tabs };
+
                 if self.nesting == 0 {
                     // Determine indent or dedent:
                     let current_indentation = *self.indentation_stack.last().unwrap();
-                    if col == current_indentation {
-                        // Same same
-                    } else if col > current_indentation {
-                        // New indentation level:
-                        self.indentation_stack.push(col);
-                        let tok_start = self.get_pos();
-                        let tok_end = tok_start.clone();
-                        return Some(Ok((tok_start, Tok::Indent, tok_end)));
-                    } else if col < current_indentation {
-                        // One or more dedentations
-                        // Pop off other levels until col is found:
-
-                        while col < *self.indentation_stack.last().unwrap() {
-                            self.indentation_stack.pop().unwrap();
+                    let ordering = indentation_level.compare_strict(&current_indentation);
+                    match ordering {
+                        Some(Ordering::Equal) => {
+                            // Same same
+                        }
+                        Some(Ordering::Greater) => {
+                            // New indentation level:
+                            self.indentation_stack.push(indentation_level);
                             let tok_start = self.get_pos();
                             let tok_end = tok_start.clone();
-                            self.pending.push(Ok((tok_start, Tok::Dedent, tok_end)));
+                            return Some(Ok((tok_start, Tok::Indent, tok_end)));
                         }
+                        Some(Ordering::Less) => {
+                            // One or more dedentations
+                            // Pop off other levels until col is found:
 
-                        if col != *self.indentation_stack.last().unwrap() {
-                            // TODO: handle wrong indentations
-                            panic!("Non matching indentation levels!");
+                            loop {
+                                let ordering = indentation_level
+                                    .compare_strict(self.indentation_stack.last().unwrap());
+                                match ordering {
+                                    Some(Ordering::Less) => {
+                                        self.indentation_stack.pop();
+                                        let tok_start = self.get_pos();
+                                        let tok_end = tok_start.clone();
+                                        self.pending.push(Ok((tok_start, Tok::Dedent, tok_end)));
+                                    }
+                                    None => {
+                                        panic!("inconsistent use of tabs and spaces in indentation")
+                                    }
+                                    _ => {
+                                        break;
+                                    }
+                                };
+                            }
+
+                            if indentation_level != *self.indentation_stack.last().unwrap() {
+                                // TODO: handle wrong indentations
+                                panic!("Non matching indentation levels!");
+                            }
+
+                            return Some(self.pending.remove(0));
                         }
-
-                        return Some(self.pending.remove(0));
+                        None => panic!("inconsistent use of tabs and spaces in indentation"),
                     }
                 }
             }
@@ -733,6 +903,9 @@ where
                 }
                 Some(')') => {
                     let result = self.eat_single_char(Tok::Rpar);
+                    if self.nesting == 0 {
+                        return Some(Err(LexicalError::NestingError));
+                    }
                     self.nesting -= 1;
                     return Some(result);
                 }
@@ -743,6 +916,9 @@ where
                 }
                 Some(']') => {
                     let result = self.eat_single_char(Tok::Rsqb);
+                    if self.nesting == 0 {
+                        return Some(Err(LexicalError::NestingError));
+                    }
                     self.nesting -= 1;
                     return Some(result);
                 }
@@ -753,6 +929,9 @@ where
                 }
                 Some('}') => {
                     let result = self.eat_single_char(Tok::Rbrace);
+                    if self.nesting == 0 {
+                        return Some(Err(LexicalError::NestingError));
+                    }
                     self.nesting -= 1;
                     return Some(result);
                 }
@@ -897,6 +1076,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::{make_tokenizer, NewlineHandler, Tok};
+    use num_bigint::BigInt;
     use std::iter::FromIterator;
     use std::iter::Iterator;
 
@@ -928,10 +1108,44 @@ mod tests {
             vec![
                 Tok::String {
                     value: "\\\\".to_string(),
+                    is_fstring: false,
                 },
                 Tok::String {
                     value: "\\".to_string(),
+                    is_fstring: false,
                 }
+            ]
+        );
+    }
+
+    #[test]
+    fn test_numbers() {
+        let source = String::from("0x2f 0b1101 0 123 0.2 2j 2.2j");
+        let tokens = lex_source(&source);
+        assert_eq!(
+            tokens,
+            vec![
+                Tok::Int {
+                    value: BigInt::from(47),
+                },
+                Tok::Int {
+                    value: BigInt::from(13),
+                },
+                Tok::Int {
+                    value: BigInt::from(0),
+                },
+                Tok::Int {
+                    value: BigInt::from(123),
+                },
+                Tok::Float { value: 0.2 },
+                Tok::Complex {
+                    real: 0.0,
+                    imag: 2.0,
+                },
+                Tok::Complex {
+                    real: 0.0,
+                    imag: 2.2,
+                },
             ]
         );
     }
@@ -943,7 +1157,7 @@ mod tests {
             fn $name() {
                 let source = String::from(format!(r"99232  # {}", $eol));
                 let tokens = lex_source(&source);
-                assert_eq!(tokens, vec![Tok::Number { value: "99232".to_string() }]);
+                assert_eq!(tokens, vec![Tok::Int { value: BigInt::from(99232) }]);
             }
             )*
         }
@@ -966,9 +1180,9 @@ mod tests {
                 assert_eq!(
                     tokens,
                     vec![
-                        Tok::Number { value: "123".to_string() },
+                        Tok::Int { value: BigInt::from(123) },
                         Tok::Newline,
-                        Tok::Number { value: "456".to_string() },
+                        Tok::Int { value: BigInt::from(456) },
                     ]
                 )
             }
@@ -993,16 +1207,16 @@ mod tests {
                     name: String::from("avariable"),
                 },
                 Tok::Equal,
-                Tok::Number {
-                    value: "99".to_string()
+                Tok::Int {
+                    value: BigInt::from(99)
                 },
                 Tok::Plus,
-                Tok::Number {
-                    value: "2".to_string()
+                Tok::Int {
+                    value: BigInt::from(2)
                 },
                 Tok::Minus,
-                Tok::Number {
-                    value: "0".to_string()
+                Tok::Int {
+                    value: BigInt::from(0)
                 },
             ]
         );
@@ -1028,7 +1242,7 @@ mod tests {
                         Tok::Newline,
                         Tok::Indent,
                         Tok::Return,
-                        Tok::Number { value: "99".to_string() },
+                        Tok::Int { value: BigInt::from(99) },
                         Tok::Newline,
                         Tok::Dedent,
                     ]
@@ -1071,7 +1285,45 @@ mod tests {
                         Tok::Newline,
                         Tok::Indent,
                         Tok::Return,
-                        Tok::Number { value: "99".to_string() },
+                        Tok::Int { value: BigInt::from(99) },
+                        Tok::Newline,
+                        Tok::Dedent,
+                        Tok::Dedent,
+                    ]
+                );
+            }
+        )*
+        }
+    }
+
+    macro_rules! test_double_dedent_with_tabs {
+        ($($name:ident: $eol:expr,)*) => {
+        $(
+            #[test]
+            fn $name() {
+                let source = String::from(format!("def foo():{}\tif x:{}{}\t return 99{}{}", $eol, $eol, $eol, $eol, $eol));
+                let tokens = lex_source(&source);
+                assert_eq!(
+                    tokens,
+                    vec![
+                        Tok::Def,
+                        Tok::Name {
+                            name: String::from("foo"),
+                        },
+                        Tok::Lpar,
+                        Tok::Rpar,
+                        Tok::Colon,
+                        Tok::Newline,
+                        Tok::Indent,
+                        Tok::If,
+                        Tok::Name {
+                            name: String::from("x"),
+                        },
+                        Tok::Colon,
+                        Tok::Newline,
+                        Tok::Indent,
+                        Tok::Return,
+                        Tok::Int { value: BigInt::from(99) },
                         Tok::Newline,
                         Tok::Dedent,
                         Tok::Dedent,
@@ -1086,6 +1338,12 @@ mod tests {
         test_double_dedent_windows_eol: WINDOWS_EOL,
         test_double_dedent_mac_eol: MAC_EOL,
         test_double_dedent_unix_eol: UNIX_EOL,
+    }
+
+    test_double_dedent_with_tabs! {
+        test_double_dedent_tabs_windows_eol: WINDOWS_EOL,
+        test_double_dedent_tabs_mac_eol: MAC_EOL,
+        test_double_dedent_tabs_unix_eol: UNIX_EOL,
     }
 
     macro_rules! test_newline_in_brackets {
@@ -1103,9 +1361,9 @@ mod tests {
                         },
                         Tok::Equal,
                         Tok::Lsqb,
-                        Tok::Number { value: "1".to_string() },
+                        Tok::Int { value: BigInt::from(1) },
                         Tok::Comma,
-                        Tok::Number { value: "2".to_string() },
+                        Tok::Int { value: BigInt::from(2) },
                         Tok::Rsqb,
                         Tok::Newline,
                     ]
@@ -1146,21 +1404,27 @@ mod tests {
             vec![
                 Tok::String {
                     value: String::from("double"),
+                    is_fstring: false,
                 },
                 Tok::String {
                     value: String::from("single"),
+                    is_fstring: false,
                 },
                 Tok::String {
                     value: String::from("can't"),
+                    is_fstring: false,
                 },
                 Tok::String {
                     value: String::from("\\\""),
+                    is_fstring: false,
                 },
                 Tok::String {
                     value: String::from("\t\r\n"),
+                    is_fstring: false,
                 },
                 Tok::String {
                     value: String::from("\\g"),
+                    is_fstring: false,
                 },
             ]
         );
@@ -1178,6 +1442,7 @@ mod tests {
                     vec![
                         Tok::String {
                             value: String::from("abcdef"),
+                            is_fstring: false,
                         },
                     ]
                 )
